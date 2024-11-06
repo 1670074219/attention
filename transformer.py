@@ -344,29 +344,29 @@ class Transformer(nn.Module):
         return out
     
 
-# # 假设源和目标词汇表大小
-# src_vocab_size = 10000
-# trg_vocab_size = 10000
+# 假设源和目标词汇表大小
+src_vocab_size = 10000
+trg_vocab_size = 10000
 
-# # 定义填充索引
-# src_pad_idx = 1
-# trg_pad_idx = 1
+# 定义填充索引
+src_pad_idx = 1
+trg_pad_idx = 1
 
-# # 其他参数
-# embed_size = 512
-# num_layers = 6
-# heads = 8
-# forward_expansion = 4
-# dropout = 0.1
-# max_length = 100
+# 其他参数
+embed_size = 512
+num_layers = 6
+heads = 8
+forward_expansion = 4
+dropout = 0.1
+max_length = 100
 
-# # 模拟输入数据
-# src = torch.randint(0, src_vocab_size, (2, 20))  # (batch_size=2, src_seq_len=20)
-# trg = torch.randint(0, trg_vocab_size, (2, 20))  # (batch_size=2, trg_seq_len=20)
+# 模拟输入数据
+src = torch.randint(0, src_vocab_size, (2, 20))  # (batch_size=2, src_seq_len=20)
+trg = torch.randint(0, trg_vocab_size, (2, 20))  # (batch_size=2, trg_seq_len=20)
 
-# # 实例化 Transformer 模型并进行前向传播
-# model = Transformer(src_vocab_size, trg_vocab_size, src_pad_idx, trg_pad_idx, 
-#                     embed_size, num_layers, forward_expansion, heads, dropout, max_length)
+# 实例化 Transformer 模型并进行前向传播
+model = Transformer(src_vocab_size, trg_vocab_size, src_pad_idx, trg_pad_idx, 
+                    embed_size, num_layers, forward_expansion, heads, dropout, max_length)
 
-# out = model(src, trg)
-# print("Transformer 模型的输出形状：", out.shape)
+out = model(src, trg)
+print("Transformer 模型的输出形状：", out.shape)
