@@ -27,7 +27,7 @@ print("parquet_files:", parquet_files)  # 打印所有 parquet 文件的路径
 # 将所有 parquet 文件加载合并为一个 DataFrame
 df_list = [pd.read_parquet(file) for file in parquet_files]  # 读取每个 parquet 文件并存储在列表中
 df = pd.concat(df_list, ignore_index=True)  # 将所有 DataFrame 合并为一个
-#df = df.head(50) # 仅使用前 50 行数据进行训练
+df = df.head(20000) # 仅使用前 50 行数据进行训练
 
 # 检查合并后的数据
 print("合并后的数据集大小:", df.shape)  # 打印合并后的数据集大小
@@ -65,6 +65,9 @@ def build_vocab(tokenized_texts, max_vocab_size=10000):
 
 en_vocab = build_vocab(en_tokenized)  # 构建英文词汇表
 zh_vocab = build_vocab(zh_tokenized)  # 构建中文词汇表
+
+print(f"英文词汇表大小: {len(en_vocab)}")
+print(f"中文词汇表大小: {len(zh_vocab)}")
 
 # 将句子编码为ID序列
 def encode_sentence(sentence, vocab, add_sos_eos=True):
@@ -110,7 +113,7 @@ def collate_fn(batch):
 dataset = TranslationDataset(en_encoded, zh_encoded)  # 创建自定义数据集
 train_dataloader = DataLoader(
     dataset, 
-    batch_size=32,   
+    batch_size=16,   
     shuffle=True, 
     collate_fn=collate_fn
 )  # 创建数据加载器
@@ -130,24 +133,27 @@ model = transformer.Transformer(
     trg_vocab_size=len(zh_vocab),
     src_pad_idx=en_vocab['<PAD>'],
     trg_pad_idx=zh_vocab['<PAD>'],
-    embed_size=512,  
-    num_layers=6,    
-    heads=8,
-    forward_expansion=4,  
+    embed_size=256,  
+    num_layers=3,    
+    heads=4,
+    forward_expansion=2,  
     dropout=0.1,
-    max_length=1000  
+    max_length=1000 
 ).to(device)
 
 # 定义损失函数和优化器
 loss_fn = nn.CrossEntropyLoss(ignore_index=zh_vocab['<PAD>'])
 optimizer = optim.Adam(model.parameters(), lr=3e-4)
 
+num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"模型的可训练参数数量: {num_params}")
+
 # 训练循环
 num_epochs = 2
 for epoch in range(num_epochs):
     model.train()
     epoch_loss = 0
-    for en_batch, zh_batch in train_dataloader:
+    for i, (en_batch, zh_batch) in enumerate(train_dataloader):
         en_batch = en_batch.to(device)
         zh_batch = zh_batch.to(device)
         
@@ -159,6 +165,7 @@ for epoch in range(num_epochs):
         loss.backward()
         optimizer.step()
         epoch_loss += loss.item()
+        print(f"批次损失: {loss.item():.4f}", f"批次: {i+1}")
     
     print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {epoch_loss / len(train_dataloader):.4f}")
 
