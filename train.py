@@ -9,15 +9,25 @@ import spacy  # 导入 spacy 库用于英文分词
 import os  # 导入 os 库用于文件和目录操作
 import pandas as pd  # 导入 pandas 库用于数据处理
 import transformer
+from torch.amp import autocast, GradScaler  # 添加混合精度训练支持
+from tqdm import tqdm  # 添加进度条支持
+
+# 在代码开头添加
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128,expandable_segments:True'
+
+# 设置设备
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"使用设备: {device}")
 
 # 1. 数据读取和合并
 folder_path = "Dataset"  # 替换为你的数据文件夹路径
 parquet_files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if f.endswith('.parquet')]  # 获取所有 parquet 文件的路径
+print("parquet_files:", parquet_files)  # 打印所有 parquet 文件的路径
 
-# 将所有 parquet 文件加载并合并为一个 DataFrame
+# 将所有 parquet 文件加载合并为一个 DataFrame
 df_list = [pd.read_parquet(file) for file in parquet_files]  # 读取每个 parquet 文件并存储在列表中
 df = pd.concat(df_list, ignore_index=True)  # 将所有 DataFrame 合并为一个
-df = df.head(50) # 仅使用前 50 行数据进行训练
+#df = df.head(50) # 仅使用前 50 行数据进行训练
 
 # 检查合并后的数据
 print("合并后的数据集大小:", df.shape)  # 打印合并后的数据集大小
@@ -72,7 +82,7 @@ class TranslationDataset(Dataset):
         self.zh_data = zh_data  # 中文数据
     
     def __len__(self):
-        return len(self.en_data)  # 返回数据集的大小
+        return len(self.en_data)  # 返回数据集大小
     
     def __getitem__(self, idx):
         return torch.tensor(self.en_data[idx]), torch.tensor(self.zh_data[idx])  # 返回指定索引的数据
@@ -98,7 +108,12 @@ def collate_fn(batch):
     return en_batch, zh_batch  # 返回填充后的批次数据
 
 dataset = TranslationDataset(en_encoded, zh_encoded)  # 创建自定义数据集
-train_dataloader = DataLoader(dataset, batch_size=32, shuffle=True, collate_fn=collate_fn)  # 创建数据加载器
+train_dataloader = DataLoader(
+    dataset, 
+    batch_size=32,   
+    shuffle=True, 
+    collate_fn=collate_fn
+)  # 创建数据加载器
 
 # 检查数据加载器
 for en_batch, zh_batch in train_dataloader:
@@ -109,17 +124,18 @@ for en_batch, zh_batch in train_dataloader:
 
 # 模型实例化
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("使用设备:", device)
 model = transformer.Transformer(
     src_vocab_size=len(en_vocab),
     trg_vocab_size=len(zh_vocab),
     src_pad_idx=en_vocab['<PAD>'],
     trg_pad_idx=zh_vocab['<PAD>'],
-    embed_size=512,
-    num_layers=6,
+    embed_size=512,  
+    num_layers=6,    
     heads=8,
-    forward_expansion=4,
+    forward_expansion=4,  
     dropout=0.1,
-    max_length=100
+    max_length=1000  
 ).to(device)
 
 # 定义损失函数和优化器

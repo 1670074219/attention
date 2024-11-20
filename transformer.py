@@ -1,19 +1,47 @@
 import torch
 import torch.nn as nn
 import math
+from torch.amp import autocast, GradScaler
+
+# 设置设备
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class PositionalEncoding(nn.Module):
     def __init__(self, embed_size, max_len=5000):
+        """
+        初始化位置编码层
+        参数:
+            embed_size: 词嵌入维度
+            max_len: 最大序列长度
+        """
         super(PositionalEncoding, self).__init__()
+        # 创建一个零矩阵来存储位置编码
         pe = torch.zeros(max_len, embed_size)
+        # 生成位置索引矩阵，形状为 (max_len, 1)
         position = torch.arange(0, max_len).unsqueeze(1)
+        # 计算分母项
         div_term = torch.exp(torch.arange(0, embed_size, 2) * (-math.log(10000.0) / embed_size))
+        # 计算正弦位置编码
         pe[:, 0::2] = torch.sin(position * div_term)
+        # 计算余弦位置编码
         pe[:, 1::2] = torch.cos(position * div_term)
+        # 添加批次维度
         pe = pe.unsqueeze(0)
+        # 将位置编码注册为缓冲区（不参与训练）
         self.register_buffer('pe', pe)
 
     def forward(self, x):
+        """
+        前向传播
+        参数:
+            x: 输入张量，形状为 (batch_size, seq_len, embed_size)
+        返回:
+            添加位置编码后的张量
+        """
+        # 检查输入序列长度是否超过最大长度
+        if x.size(1) > self.pe.size(1):
+            raise ValueError(f"输入序列长度 ({x.size(1)}) 超过位置编码的最大长度 ({self.pe.size(1)})")
+        # 将位置编码加到输入上
         x = x + self.pe[:, :x.size(1), :]
         return x
     
@@ -34,57 +62,78 @@ class PositionalEncoding(nn.Module):
     
 class MultiHeadAttention(nn.Module):
     def __init__(self, embed_size, heads):
-        super(MultiHeadAttention, self).__init__()
-        self.embed_size = embed_size
-        self.heads = heads
-        self.head_dim = embed_size // heads
+        """
+        初始化多头注意力层
+        参数:
+            embed_size: 词嵌入维度
+            heads: 注意力头数
+        """
+        super(MultiHeadAttention, self).__init__()  # 初始化父类
+        self.embed_size = embed_size  # 存储嵌入维度大小
+        self.heads = heads  # 存储注意力头的数量
+        self.head_dim = embed_size // heads  # 计算每个注意力头的维度
 
-        assert(
-            self.head_dim * heads == embed_size
-        ), "Embedding size needs to be divisible by heads"
+        # 验证嵌入维度是否可以被头数整除
+        assert(self.head_dim * heads == embed_size), "嵌入维度需要能够被头数整除"
 
-        self.values = nn.Linear(self.head_dim, self.head_dim, bias=False)
-        self.keys = nn.Linear(self.head_dim, self.head_dim, bias=False)
-        self.queries = nn.Linear(self.head_dim, self.head_dim, bias=False)
-
+        # 创建三个线性变换层，用于转换查询、键和值
+        # 输入维度是embed_size，输出维度是head_dim * heads
+        self.values = nn.Linear(embed_size, self.head_dim * heads, bias=False)
+        self.keys = nn.Linear(embed_size, self.head_dim * heads, bias=False)
+        self.queries = nn.Linear(embed_size, self.head_dim * heads, bias=False)
+        
+        # 创建输出的线性变换层
         self.fc_out = nn.Linear(heads * self.head_dim, embed_size)
 
     def forward(self, query, keys, values, mask):
-        N = query.shape[0] # batch_size
+        """
+        前向传播
+        参数:
+            query: 查询张量
+            keys: 键张量
+            values: 值张量
+            mask: 掩码张量
+        """
+        N = query.shape[0]  # 批次大小
         value_len, key_len, query_len = values.shape[1], keys.shape[1], query.shape[1]
 
+        # 对输入进行线性变换
+        values = self.values(values)  # [N, value_len, embed_size]
+        keys = self.keys(keys)        # [N, key_len, embed_size]
+        queries = self.queries(query)  # [N, query_len, embed_size]
+
+        # 重塑张量维度，将每个头的数据分开
+        # [N, seq_len, heads, head_dim]
         values = values.reshape(N, value_len, self.heads, self.head_dim)
         keys = keys.reshape(N, key_len, self.heads, self.head_dim)
-        queries = query.reshape(N, query_len, self.heads, self.head_dim)
+        queries = queries.reshape(N, query_len, self.heads, self.head_dim)
 
-        # energy = torch.einsum("nqhd,nkhd->nhqk", [queries, keys])
-        # 将每个头的数据分开计算内积：对最后一个维度 (head_dim) 进行矩阵乘法
-        energy = torch.zeros(N, self.heads, query_len, key_len)  # 初始化输出张量
-        for b in range(N):  # 遍历每个 batch
-            for h in range(self.heads):    # 遍历每个注意力头
-                # queries[b, :, h, :] 的形状是 (query_len, head_dim)
-                # keys[b, :, h, :] 的形状是 (key_len, head_dim)
-                # 转置 keys 的最后两个维度，以便进行矩阵乘法
-                energy[b, h] = torch.matmul(queries[b, :, h, :], keys[b, :, h, :].transpose(0, 1))
+        # 使用爱因斯坦求和计算注意力分数
+        # queries shape: (N, query_len, heads, head_dim)
+        # keys shape: (N, key_len, heads, head_dim)
+        # energy shape: (N, heads, query_len, key_len)
+        energy = torch.einsum("nqhd,nkhd->nhqk", [queries, keys])
 
+        # 如果提供了掩码，则应用掩码
         if mask is not None:
-            energy = energy.masked_fill(mask == 0, float("-1e20"))
+            mask = mask.to(energy.device)
+            energy = energy.masked_fill(mask == 0, -1e4)
 
-        attention = torch.softmax(energy / (self.head_dim ** (1 / 2)), dim=3)
+        # 计算注意力权重（使用缩放点积注意力机制）
+        attention = torch.softmax(energy / (self.head_dim ** (1/2)), dim=3)
 
-        # out = torch.einsum("bhqk,bkhd->bqhd", [attention, values])  # (batch_size, query_len, heads, head_dim) 
-        # 初始化输出张量，形状为 (batch_size, query_len, heads, head_dim)
-        out = torch.zeros(N, query_len, self.heads, self.head_dim)
-        # 遍历每个 batch 和每个头进行计算
-        for b in range(N):  # 遍历每个 batch
-            for h in range(self.heads):   # 遍历每个注意力头
-                for q in range(query_len):  # 遍历每个 query
-                    # 对 values 的 key_len 维度进行加权求和
-                    # 注意力权重 (1, key_len) @ values (key_len, head_dim) -> (1, head_dim)
-                    out[b, q, h, :] = torch.matmul(attention[b, h, q, :], values[b, :, h, :])
+        # 确保注意力权重在正确的设备上
+        attention = attention.to(values.device)
+
+        # 使用注意力权重和值计算输出
+        # attention shape: (N, heads, query_len, key_len)
+        # values shape: (N, value_len, heads, head_dim)
+        # out shape: (N, query_len, heads, head_dim)
+        out = torch.einsum("nhqk,nkhd->nqhd", [attention, values])
         
-        out = out.reshape(N, query_len, self.heads * self.head_dim)
-        out = self.fc_out(out)
+        # 重塑输出张量并通过最终的线性层
+        out = out.reshape(N, query_len, self.heads * self.head_dim)  # [N, query_len, embed_size]
+        out = self.fc_out(out)  # 通过输出线性层
         return out
 
 class CustomLayerNorm(nn.Module):
@@ -104,38 +153,58 @@ class CustomLayerNorm(nn.Module):
 class CustomDropout(nn.Module):
     def __init__(self, p=0.5):
         super(CustomDropout, self).__init__()
-        self.p = p # 丢弃概率
+        if not 0 <= p <= 1:
+            raise ValueError(f"Dropout probability has to be between 0 and 1, but got {p}")
+        self.p = p
 
     def forward(self, x):
         if self.training:
-            mask = (torch.rand_like(x) > self.p).float()
+            # 直接在与输入相同的设备上生成掩码
+            mask = (torch.rand_like(x, device=x.device) > self.p).float()
             return x * mask / (1 - self.p)
-        else:
-            return x * (1 - self.p)
+        return x
 
 class EncoderBlock(nn.Module):
     def __init__(self, embed_size, heads, forward_expansion, dropout):
+        """
+        初始化编码器块
+        参数:
+            embed_size: 词嵌入维度
+            heads: 注意力头数
+            forward_expansion: 前馈网络扩展因子
+            dropout: dropout比率
+        """
         super(EncoderBlock, self).__init__()
+        # 多头自注意力层
         self.attention = MultiHeadAttention(embed_size, heads)
+        # 两个层归一化层
         self.norm1 = CustomLayerNorm(embed_size)
         self.norm2 = CustomLayerNorm(embed_size)
 
+        # 前馈神经网络
         self.feed_forward = nn.Sequential(
             nn.Linear(embed_size, forward_expansion * embed_size),
             nn.ReLU(),
             nn.Linear(forward_expansion * embed_size, embed_size)
         )
 
+        # Dropout层
         self.dropout = CustomDropout(dropout)
 
     def forward(self, x, mask):
+        """
+        前向传播
+        参数:
+            x: 输入张量
+            mask: 掩码张量
+        """
         # 1.多头自注意力层
         attention = self.attention(x, x, x, mask)
-        # 2.残差连接 + Layer Normalization
+        # 2.第一个残差连接和层归一化
         x = self.dropout(self.norm1(attention + x))
-        # 3.前馈神经网络层
+        # 3.前馈神经网络
         forward = self.feed_forward(x)
-        # 4.残差连接 + Layer Normalization
+        # 4.第二个残差连接和层归一化
         out = self.dropout(self.norm2(forward + x))
         return out
     
@@ -148,7 +217,7 @@ class EncoderBlock(nn.Module):
 # seq_length = 10
 # batch_size = 2
 
-# # 假设我们有一个输入张量 x
+# # 假设我们一个输入张量 x
 # x = torch.rand(batch_size, seq_length, embed_size)
 # mask = None  # 可以暂时不使用 mask
 
@@ -211,7 +280,7 @@ class DecoderBlock(nn.Module):
     def __init__(self, embed_size, heads, forward_expansion, dropout):
         super(DecoderBlock, self).__init__()
 
-        # 自注意力层，使用掩码避免信息泄露
+        # 自注意力层，使用掩码避免息泄露
         self.self_attention = MultiHeadAttention(embed_size, heads)
         self.norm1 = CustomLayerNorm(embed_size)
 
@@ -305,46 +374,56 @@ class TransformerDecoder(nn.Module):
 class Transformer(nn.Module):
     def __init__(self, src_vocab_size, trg_vocab_size, src_pad_idx, trg_pad_idx,
                  embed_size=512, num_layers=6, forward_expansion=4, heads=8,
-                 dropout=0.1, max_length=100):
+                 dropout=0.1, max_length=200, device=device):
         super(Transformer, self).__init__()
-
-        #初始化编码器和解码器
-        self.encoder = TransformerEncoder(src_vocab_size, embed_size, num_layers, heads, forward_expansion, dropout, max_length)
-        self.decoder = TransformerDecoder(trg_vocab_size, embed_size, num_layers, heads, forward_expansion, dropout, max_length)
-    
-        #输出层，将解码器的输出映射到词汇表的大小
+        
+        self.device = device  # 存储设备信息
+        
+        # 将编码器移至指定设备
+        self.encoder = TransformerEncoder(
+            src_vocab_size, embed_size, num_layers, heads, 
+            forward_expansion, dropout, max_length
+        ).to(device)
+        
+        # 将解码器移至指定设备
+        self.decoder = TransformerDecoder(
+            trg_vocab_size, embed_size, num_layers, heads,
+            forward_expansion, dropout, max_length
+        ).to(device)
+        
         self.src_pad_idx = src_pad_idx
         self.trg_pad_idx = trg_pad_idx
-        self.embed_size = embed_size
+        
+        # 将整个模型移至指定设备
+        self.to(device)
 
     def make_src_mask(self, src):
-        # 生成 src_mask，用于编码器-解码器注意力层，屏蔽源序列中的填充词
+        # 直接在正确的设备上创建掩码
         src_mask = (src != self.src_pad_idx).unsqueeze(1).unsqueeze(2)
-        # src_mask 形状：(batch_size, 1, 1, src_len)
-        return src_mask
+        return src_mask.to(self.device)
     
     def make_trg_mask(self, trg):
-        # 生成 trg_mask，用于解码器自注意力层，防止解码器看到未来的信息
-        trg_len = trg.shape[1]
-        trg_mask = torch.tril(torch.ones((trg_len, trg_len), device=trg.device)).bool() # (trg_len, trg_len)
-        trg_padding_mask = (trg != self.trg_pad_idx).unsqueeze(1).unsqueeze(2) # (batch_size, 1, 1, trg_len)
-        trg_mask = trg_mask & trg_padding_mask # (batch_size, 1, trg_len, trg_len)
-        return trg_mask
+        N, trg_len = trg.shape
+        # 直接在正确的设备上创建掩码
+        trg_mask = torch.tril(torch.ones((trg_len, trg_len), device=self.device)).bool()
+        trg_mask = trg_mask.expand(N, 1, trg_len, trg_len)
+        padding_mask = (trg != self.trg_pad_idx).unsqueeze(1).unsqueeze(2)
+        return (trg_mask & padding_mask).to(self.device)
 
     def forward(self, src, trg):
-        # 生成源序列和目标序列的掩码
+        # 确保输入数据在正确的设备上
+        src = src.to(self.device)
+        trg = trg.to(self.device)
+        
         src_mask = self.make_src_mask(src)
         trg_mask = self.make_trg_mask(trg)
-
-        # 编码器处理源序列
-        enc_src = self.encoder(src, src_mask) # (batch_size, src_len, embed_size)
-
-        # 解码器处理目标序列和编码器输出
+        
+        enc_src = self.encoder(src, src_mask)
         out = self.decoder(trg, enc_src, src_mask, trg_mask)
         return out
     
 
-# # 假设源和目标词汇表大小
+# # 假设源和标词汇表大小
 # src_vocab_size = 10000
 # trg_vocab_size = 10000
 
@@ -360,7 +439,7 @@ class Transformer(nn.Module):
 # dropout = 0.1
 # max_length = 100
 
-# # 模拟输入数据
+# # 模拟输数据
 # src = torch.randint(0, src_vocab_size, (2, 20))  # (batch_size=2, src_seq_len=20)
 # trg = torch.randint(0, trg_vocab_size, (2, 20))  # (batch_size=2, trg_seq_len=20)
 
@@ -370,3 +449,89 @@ class Transformer(nn.Module):
 
 # out = model(src, trg)
 # print("Transformer 模型的输出形状：", out.shape)
+
+
+
+
+# def train_model():
+#     # 模型参数设置
+#     src_vocab_size = 10000
+#     trg_vocab_size = 10000
+#     src_pad_idx = 1
+#     trg_pad_idx = 1
+#     embed_size = 512
+#     num_layers = 6
+#     heads = 8
+#     forward_expansion = 4
+#     dropout = 0.1
+#     max_length = 100
+#     learning_rate = 0.0001
+#     batch_size = 32
+    
+#     print(f"使用设备: {device}")
+    
+#     # 实例化模型并移至GPU
+#     model = Transformer(
+#         src_vocab_size, trg_vocab_size, src_pad_idx, trg_pad_idx,
+#         embed_size, num_layers, forward_expansion, heads,
+#         dropout, max_length, device
+#     )
+    
+#     # 设置优化器和损失函数
+#     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+#     criterion = nn.CrossEntropyLoss(ignore_index=trg_pad_idx)
+#     scaler = GradScaler()  # 更新 GradScaler
+    
+#     # 添加学习率调度器
+#     from torch.optim.lr_scheduler import LambdaLR
+    
+#     def lr_lambda(step):
+#         # 实现预热策略
+#         warmup_steps = 4000
+#         step = float(step + 1)
+#         return min(step ** (-0.5), step * warmup_steps ** (-1.5))
+    
+#     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, betas=(0.9, 0.98), eps=1e-9)
+#     scheduler = LambdaLR(optimizer, lr_lambda)
+    
+#     def train_step(src, trg):
+#         model.train()
+#         optimizer.zero_grad()
+        
+#         with autocast(device_type='cuda', dtype=torch.float16):
+#             output = model(src, trg[:, :-1])
+#             output = output.reshape(-1, output.shape[-1])
+#             target = trg[:, 1:].reshape(-1)
+#             loss = criterion(output, target)
+        
+#         scaler.scale(loss).backward()
+#         scaler.unscale_(optimizer)
+#         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+#         scaler.step(optimizer)
+#         scaler.update()
+#         scheduler.step()
+        
+#         return loss.item()
+    
+#     try:
+#         # 示例训练数据
+#         src = torch.randint(0, src_vocab_size, (batch_size, 20)).to(device)
+#         trg = torch.randint(0, trg_vocab_size, (batch_size, 20)).to(device)
+        
+#         # 训练一个批次
+#         loss = train_step(src, trg)
+#         print(f"批次损失: {loss:.4f}")
+        
+#     except RuntimeError as e:
+#         print(f"训练出错: {str(e)}")
+#         # 如果是 CUDA 内存错误，清理内存
+#         if "out of memory" in str(e):
+#             if torch.cuda.is_available():
+#                 torch.cuda.empty_cache()
+#         raise e
+
+# if __name__ == "__main__":
+#     try:
+#         train_model()
+#     except Exception as e:
+#         print(f"程序出错: {str(e)}")
